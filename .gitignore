@@ -1,0 +1,30 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Cast hub deploy artifacts
+CastInterface/cast_hub/cast-hub.zip
+deploy/
+CastInterface/cast_hub/volview-client/
+CastInterface/cast_hub/vtkjs-worklist-client/
+CastInterface/cast_hub/cast-worklist-example/
+CastInterface/cast_hub/slim/
+CastInterface/cast_hub/OHIF-client/
+
+# Python lib/ at repo root (not cast_slicer_image_display/lib)
+/lib/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
