@@ -79,9 +79,14 @@ _base_dir = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.environ.get("CAST_REPO_ROOT", "").strip() or os.path.dirname(_base_dir)
 if _repo_root:
     _repo_root = os.path.abspath(_repo_root)
-_cast_client_src = os.path.join(_repo_root, "cast_py_client", "src")
-if _cast_client_src not in sys.path:
-    sys.path.insert(0, _cast_client_src)
+# Prefer vendored cast_py_client next to cast_hub.py (Azure zip), then monorepo layout.
+for _cast_client_src in (
+    os.path.join(_base_dir, "cast_py_client", "src"),
+    os.path.join(_repo_root, "cast_py_client", "src"),
+):
+    if os.path.isdir(_cast_client_src) and _cast_client_src not in sys.path:
+        sys.path.insert(0, _cast_client_src)
+        break
 _lib_dir = os.path.join(_base_dir, "Lib")
 if _lib_dir not in sys.path:
     sys.path.insert(0, _lib_dir)
@@ -110,6 +115,11 @@ from oauth_tokens import (
     verify_hs256_jwt,
 )
 from idc_index_service import resolve_study_series_files
+from idc_mcp_anthropic import (
+    anthropic_configured,
+    env_idc_mcp_upstream_url,
+    search_idc_via_anthropic,
+)
 
 # Default cast-request fan-out timeout (seconds). Collated HTTP reply returns
 # when all targets respond or this cap is reached (partial + timedOut ok).
@@ -744,7 +754,7 @@ async def _quiet_hub_uvicorn_access_logs() -> None:
     else:
         cast_hub_logger.info(
             "Cast hub SPA clients: none (build and sync volview-client, "
-            "vtkjs-worklist-client, slim, OHIF-client)"
+            "worklist-client, reporting-client, slicerlive, slim, ohif)"
         )
     sample_count = len(_scan_hub_sample_studies())
     samples_root = _hub_samples_root()
@@ -784,12 +794,15 @@ if os.path.exists(resources_dir):
 # Bundled SPAs at subpaths: mount_path (URL) -> folder under cast_hub/
 SPA_CLIENTS = [
     ("volview-client", "volview-client"),
-    ("worklist-client", "vtkjs-worklist-client"),
+    ("worklist-client", "worklist-client"),
+    ("reporting-client", "reporting-client"),
+    ("slicerlive", "slicerlive"),
     ("slim", "slim"),
+    ("ohif", "OHIF-client"),
 ]
 
-# OHIF is served at hub root (/) — see _register_hub_root_spa() after API routes.
-HUB_ROOT_SPA_FOLDER = "OHIF-client"
+# Legacy: OHIF used to be served at hub root. Prefer SPA_CLIENTS entry ``ohif``.
+HUB_ROOT_SPA_FOLDER = ""
 
 
 def _register_spa_client(app, mount_path: str, client_folder: str) -> bool:
@@ -843,7 +856,10 @@ def _register_spa_client(app, mount_path: str, client_folder: str) -> bool:
 
 
 def _register_hub_root_spa(app, client_folder: str) -> bool:
-    """Serve OHIF at hub ``/`` (GET). Must register after API routes."""
+    """Optional SPA at hub ``/`` (GET). Unused when OHIF is under ``/ohif/``."""
+    client_folder = str(client_folder or "").strip()
+    if not client_folder:
+        return False
     client_dir = os.path.join(base_dir, client_folder)
     index_path = os.path.join(client_dir, "index.html")
     if not os.path.isdir(client_dir) or not os.path.isfile(index_path):
@@ -854,7 +870,7 @@ def _register_hub_root_spa(app, client_folder: str) -> bool:
         app.mount(
             "/assets",
             StaticFiles(directory=assets_dir),
-            name="spa_ohif_hub_root_assets",
+            name="spa_hub_root_assets",
         )
 
     async def hub_root_spa(full_path: str = ""):
@@ -865,12 +881,12 @@ def _register_hub_root_spa(app, client_folder: str) -> bool:
                 return FileResponse(requested_file)
         return FileResponse(index_path)
 
-    app.add_api_route("/", hub_root_spa, methods=["GET"], name="hub_root_ohif_index")
+    app.add_api_route("/", hub_root_spa, methods=["GET"], name="hub_root_spa_index")
     app.add_api_route(
         "/{full_path:path}",
         hub_root_spa,
         methods=["GET"],
-        name="hub_root_ohif_catchall",
+        name="hub_root_spa_catchall",
     )
     return True
 
@@ -1774,7 +1790,7 @@ async def get_hub_sample_file(study_id: str, file_name: str):
 
 
 IDC_MCP_UPSTREAM_DEFAULT = (
-    "https://idc-mcp-v3-293449031882.us-central1.run.app/mcp"
+    "https://api.imaging.datacommons.cancer.gov/mcp"
 )
 
 
@@ -1855,9 +1871,76 @@ async def post_hub_idc_series_files(request: Request):
     return result
 
 
+@app.get("/api/hub/idc-mcp/status")
+@app.get("/api/hub/idc-mcp/status/")
+async def get_hub_idc_mcp_status():
+    """Report IDC MCP + Anthropic search availability for worklist clients."""
+    return {
+        "anthropic": anthropic_configured(),
+        "idcMcpUrl": env_idc_mcp_upstream_url(),
+    }
+
+
+@app.post("/api/hub/idc-mcp/search")
+@app.post("/api/hub/idc-mcp/search/")
+async def post_hub_idc_mcp_search(request: Request):
+    """Natural-language IDC cohort search via Anthropic MCP connector."""
+    if not anthropic_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "ANTHROPIC_API_KEY is not configured on the Cast hub. "
+                "Set the environment variable and restart the hub."
+            ),
+        )
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid JSON body: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    prompt = str(payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing prompt")
+
+    max_rows_raw = payload.get("max_rows", 20)
+    try:
+        max_rows = int(max_rows_raw)
+    except (TypeError, ValueError):
+        max_rows = 20
+
+    started = time.time()
+    try:
+        result = await asyncio.to_thread(
+            search_idc_via_anthropic, prompt, max_rows
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger = logging.getLogger("cast_hub")
+        logger.exception("idc-mcp anthropic search failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Anthropic IDC MCP search failed: {exc}",
+        ) from exc
+
+    logging.getLogger("cast_hub").info(
+        "idc-mcp anthropic search prompt_len=%d series=%d elapsed=%.0fms",
+        len(prompt),
+        len(result.get("series") or []),
+        (time.time() - started) * 1000,
+    )
+    return result
+
+
 @app.post("/idc-mcp-proxy/mcp")
 async def idc_mcp_proxy(request: Request):
-    """Streamable HTTP proxy to the IDC MCP Cloud Run endpoint."""
+    """Streamable HTTP proxy to the official IDC MCP endpoint."""
     upstream = _env_idc_mcp_upstream_url()
     body = await request.body()
     forward_headers: Dict[str, str] = {}
@@ -4105,9 +4188,9 @@ async def post_oauth_token(request: Request):
     return response
 
 
-# OHIF at hub root — registered last so /api/hub, /oauth, etc. take precedence.
-if _register_hub_root_spa(app, HUB_ROOT_SPA_FOLDER):
-    _registered_spa_clients.append("/ (OHIF)")
+# Optional hub-root SPA (none by default; OHIF is at /ohif/).
+if HUB_ROOT_SPA_FOLDER and _register_hub_root_spa(app, HUB_ROOT_SPA_FOLDER):
+    _registered_spa_clients.append(f"/ ({HUB_ROOT_SPA_FOLDER})")
 
 
 def main():
@@ -4126,8 +4209,8 @@ def main():
     print("=" * 60)
     print(f"Server running on http://{args.host}:{args.port}")
     print(f"Hub API endpoint: http://{args.host}:{args.port}/api/hub/")
-    if any("OHIF" in entry for entry in _registered_spa_clients):
-        print(f"OHIF viewer: http://{args.host}:{args.port}/")
+    if any(entry.startswith("/ohif") for entry in _registered_spa_clients):
+        print(f"OHIF viewer: http://{args.host}:{args.port}/ohif/")
     print("")
     print("Test endpoints:")
     print(f"  GET    http://{args.host}:{args.port}/api/hub/admin (admin status page)")

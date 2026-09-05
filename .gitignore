@@ -12,6 +12,9 @@ dist/
 CastInterface/cast_hub/cast-hub.zip
 deploy/
 CastInterface/cast_hub/volview-client/
+CastInterface/cast_hub/worklist-client/
+CastInterface/cast_hub/reporting-client/
+CastInterface/cast_hub/slicerlive/
 CastInterface/cast_hub/vtkjs-worklist-client/
 CastInterface/cast_hub/cast-worklist-example/
 CastInterface/cast_hub/slim/
