@@ -2018,6 +2018,30 @@ def _conference_participant_subscribers(conf: Dict) -> List[str]:
     return subscriber_names
 
 
+def _host_user_name_for_topic(topic: str, explicit: str = "") -> str:
+    """Best-effort display name for the conference host."""
+    name = str(explicit or "").strip()
+    if name:
+        return name
+    topic = str(topic or "").strip()
+    if not topic:
+        return ""
+    # Prefer a still-valid auth code for this topic (may already be consumed).
+    try:
+        _purge_expired_auth_codes()
+    except Exception:
+        pass
+    for info in cast_hub.auth_codes.values():
+        if not isinstance(info, dict):
+            continue
+        if str(info.get("topic") or "").strip() != topic:
+            continue
+        candidate = str(info.get("user_name") or "").strip()
+        if candidate:
+            return candidate
+    return ""
+
+
 async def _send_conference_hub_event(
     event_name: str,
     host_topic: str,
@@ -2094,6 +2118,10 @@ async def post_conference(request: Request):
     title = str(data.get("title") or "").strip()
     attendee_topics = _normalize_conference_topics(data.get("topics", []))
     attendee_topics = [t for t in attendee_topics if t != host_topic]
+    host_user_name = _host_user_name_for_topic(
+        host_topic,
+        str(data.get("hostUserName") or data.get("host_user_name") or "").strip(),
+    )
 
     if not host_topic:
         raise HTTPException(status_code=400, detail="hostTopic is required")
@@ -2118,6 +2146,7 @@ async def post_conference(request: Request):
         {
             "title": title,
             "hostTopic": host_topic,
+            "hostUserName": host_user_name,
             "participants": subscriber_names,
         },
     )
@@ -2155,21 +2184,44 @@ async def delete_conference(request: Request):
             if leave_topic not in topics:
                 break
             conf["topics"] = [t for t in topics if t != leave_topic]
-            updated.append(conf)
+            remaining = _normalize_conference_topics(conf.get("topics", []))
             cast_hub.log(
                 f"Attendee {leave_topic} left conference {conf_title or host_topic}"
             )
-            await _send_conference_hub_event(
-                "conference-end",
-                host_topic,
-                [leave_topic],
-                {
-                    "title": conf_title,
-                    "hostTopic": host_topic,
-                    "reason": "attendee-left",
-                    "leaveTopic": leave_topic,
-                },
-            )
+            if not remaining:
+                # No attendees left — end the conference for everyone.
+                cast_hub.conferences.remove(conf)
+                removed.append(conf)
+                cast_hub.log(
+                    f"Conference ended (no attendees left): {conf_title or host_topic}"
+                )
+                await _send_conference_hub_event(
+                    "conference-end",
+                    host_topic,
+                    [host_topic, leave_topic],
+                    {
+                        "title": conf_title,
+                        "hostTopic": host_topic,
+                        "reason": "empty",
+                    },
+                )
+            else:
+                updated.append(conf)
+                # Notify host + remaining attendees (roster refresh) and the leaver.
+                notify_topics = _conference_participant_topics(conf)
+                if leave_topic not in notify_topics:
+                    notify_topics = notify_topics + [leave_topic]
+                await _send_conference_hub_event(
+                    "conference-end",
+                    host_topic,
+                    notify_topics,
+                    {
+                        "title": conf_title,
+                        "hostTopic": host_topic,
+                        "reason": "attendee-left",
+                        "leaveTopic": leave_topic,
+                    },
+                )
             break
 
         all_participant_topics = _conference_participant_topics(conf)
