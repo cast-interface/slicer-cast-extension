@@ -1,0 +1,9 @@
+{
+  "id": "lung",
+  "product": "LUNGSCREENING",
+  "title": "Lung Screening",
+  "location": "Toronto, Canada",
+  "summary": "CT lung screening (dicom-send / nifti-send). Returns a screening result line.",
+  "githubUrl": "https://github.com/cast-interface/slicer-cast-extension/blob/main/CastInterface/cast_resource_servers/products/lung_screening.py",
+  "hubEvent": "dicom-send"
+}

@@ -1,33 +1,30 @@
-"""TotalSegmentator Cast onMessage - single-threaded variant.
+#!/usr/bin/env python3
+"""TotalSegmentator Cast resource server — Slicer onMessage + standalone CLI.
 
-Functionally equivalent to ``total_segmentator.py`` but with no thread spawn
-and no module-level staging lock. Mirrors the simple shape of
-``aibrain_on_message.py``: ``onMessage`` stages, runs TotalSegmentator
-inline, publishes, and returns.
+Slicer Cast Interface (Resource Servers): point the onMessage script path at this file.
 
-Why this is safe (cross-references to ``Lib/resource_server_hub.py``):
+Standalone (plain Python, no Slicer UI) from ``CastInterface/``:
+
+    pip install -e cast_py_client
+    pip install aiohttp
+    # Optional: TotalSegmentator + torch in this Python, or PythonSlicer on PATH
+    python cast_resource_servers/products/total_segmentator.py --local
+
+Default hub is SLICER-HUB-CLOUD; ``--local`` uses ``http://127.0.0.1:2018``.
+
+Why the Slicer onMessage path is safe (cross-references to ``Lib/resource_server_hub.py``):
 
 - For ``dicom-send`` and ``nifti-send``, ``_dispatch_resource_server_on_message``
   already invokes the handler via ``asyncio.to_thread`` (one worker thread),
   off both the hub asyncio loop and the Slicer Qt UI thread.
 - The hub does **not** call ``fetch_all_payloads`` before those events; bytes are
   streamed in parallel (25 concurrent GETs by default) directly into the job
-  ``input/`` directory via ``extract_all_*_send_files_to_dir`` (PNG/JPG
-  ``*-request`` handling is unchanged).
+  ``input/`` directory via ``extract_all_*_send_files_to_dir``.
 - The hub message loop ``await``s one handler at a time per provider, so
   ``onMessage`` calls for one provider are naturally serialized.
-- The WebSocket reader runs as a separate asyncio task on the hub thread
-  and keeps draining frames into ``message_queue`` while the worker is
-  busy; WS receive is not blocked by TotalSegmentator subprocess execution.
 
-Behavior differences vs ``total_segmentator.py``:
-
-- A second ``nifti-send`` for the same topic that arrives while a previous
-  job is still running is **queued and run** sequentially instead of being
-  skipped (the old code dropped it via ``processing=True``). Messages are
-  no longer dropped.
-
-Cast UI (Resource Servers): point the script path at this file.
+Inference runs in a **subprocess** (``PythonSlicer`` + TotalSegmentator CLI when
+available, else ``python -m totalsegmentator``).
 """
 
 from __future__ import annotations
@@ -46,13 +43,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_RS_ROOT = _SCRIPT_DIR.parent
+for _extra in (
+    _SCRIPT_DIR,
+    _RS_ROOT,
+    _RS_ROOT / "runtime",
+    _RS_ROOT.parent / "cast_py_client" / "src",
+):
+    _extra_str = str(_extra)
+    if _extra.is_dir() and _extra_str not in sys.path:
+        sys.path.insert(0, _extra_str)
+
 from cast_provider_runtime import (
     CastPayloadTruncatedError,
     extract_all_dicom_send_files_to_dir,
     extract_all_nifti_send_files_to_dir,
     get_active_resource_server_products,
     publish_dicom_send_file,
-    publish_nifti_send_file,
     publish_status_update,
     record_dicom_send_received,
     record_nifti_send_received,
@@ -315,11 +323,30 @@ def build_status_response(provider: Any) -> Dict[str, Any]:
         "items": items,
     }
 TS_TASK = "total"
-# ``--fast`` breaks DICOM RT Struct export (mask z vs series slice count).
+# Job context may override; defaults stay conservative.
+# Results are always DICOM SEG published as ``dicom-send`` (SegmentSequence
+# carries labels / SNOMED / colors for IRA overlay).
 TS_FAST = False
-TS_MULTILABEL = True
 OUTPUT_DICOM_NAME = "segmentations.dcm"
-OUTPUT_NIFTI_NAME = "segmentations.nii.gz"
+
+
+def _context_task_fast(event: Dict[str, Any]) -> Tuple[str, bool]:
+    """Read ``task`` / ``fast`` from dicom-send / nifti-send context (IRA options)."""
+    ctx = event.get("context") or {}
+    if not isinstance(ctx, dict):
+        return TS_TASK, TS_FAST
+    raw_task = str(ctx.get("task") or "").strip()
+    task = raw_task or TS_TASK
+    raw_fast = ctx.get("fast")
+    if isinstance(raw_fast, bool):
+        fast = raw_fast
+    elif isinstance(raw_fast, (int, float)):
+        fast = bool(raw_fast)
+    elif isinstance(raw_fast, str):
+        fast = raw_fast.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        fast = TS_FAST
+    return task, fast
 
 
 def _safe_topic_dir_name(topic: str) -> str:
@@ -480,7 +507,13 @@ def _on_inbound_send(
         )
 
         _run_segmentation_job_body(
-            topic, product_name, job_input, job_output, job_dir, hub_event
+            topic,
+            product_name,
+            job_input,
+            job_output,
+            job_dir,
+            hub_event,
+            event,
         )
     finally:
         _job_busy = False
@@ -495,6 +528,7 @@ def _run_segmentation_job_body(
     job_output: Path,
     job_dir: Path,
     hub_event: str,
+    event: Optional[Dict[str, Any]] = None,
 ) -> None:
     output_file: Optional[Path] = None
     try:
@@ -508,16 +542,25 @@ def _run_segmentation_job_body(
             )
             return
 
-        _status_log("Segmentation started")
+        task, fast = _context_task_fast(event or {})
+        _status_log(
+            "Segmentation started (task=%s%s)",
+            task,
+            ", fast" if fast else "",
+        )
         _debug_log(
-            "starting segmentation topic=%s input=%s files=%d",
+            "starting segmentation topic=%s input=%s files=%d task=%s fast=%s",
             topic,
             job_input,
             staged_count,
+            task,
+            fast,
         )
         cli_input = _cli_input_path(job_input, hub_event)
 
-        output_file = _run_totalsegmentator(cli_input, job_output, hub_event)
+        output_file = _run_totalsegmentator(
+            cli_input, job_output, hub_event, task=task, fast=fast
+        )
         if not output_file:
             _status_error("Segmentation failed: no output produced")
             _debug_error(
@@ -534,15 +577,10 @@ def _run_segmentation_job_body(
             topic,
             output_file,
         )
-        _status_log("Publishing result…")
-        if hub_event == _NIFTI_SEND_EVENT:
-            published = publish_nifti_send_file(
-                product_name, topic, str(output_file)
-            )
-        else:
-            published = publish_dicom_send_file(
-                product_name, topic, str(output_file)
-            )
+        _status_log("Publishing dicom-send result…")
+        published = publish_dicom_send_file(
+            product_name, topic, str(output_file)
+        )
         if published:
             _debug_log(
                 "published %s to topic=%s product=%s",
@@ -602,10 +640,8 @@ def _cli_input_path(input_dir: Path, hub_event: str) -> Path:
 
 
 def _cli_output_path(output_dir: Path, hub_event: str) -> Path:
-    """Resolve TotalSegmentator ``-o`` from Cast ``hub.event``."""
-    if hub_event == _NIFTI_SEND_EVENT:
-        return output_dir / OUTPUT_NIFTI_NAME
-    if hub_event == _DICOM_SEND_EVENT:
+    """Resolve TotalSegmentator ``-o`` (always DICOM SEG path for Cast publish)."""
+    if hub_event in (_NIFTI_SEND_EVENT, _DICOM_SEND_EVENT):
         return output_dir / OUTPUT_DICOM_NAME
     raise ValueError(f"Unsupported hub.event for segmentation: {hub_event!r}")
 
@@ -614,40 +650,90 @@ def _ts_executable_name(name: str) -> str:
     return name + ".exe" if os.name == "nt" else name
 
 
-def _total_segmentator_launch_command() -> Optional[list[str]]:
-    """PythonSlicer + TotalSegmentator CLI (same pattern as Slicer extension)."""
+def _total_segmentator_script_candidates() -> list[str]:
+    """Locate TotalSegmentator console script (system + user Scripts dirs)."""
+    names = {_ts_executable_name("TotalSegmentator")}
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        if path and path not in seen and os.path.isfile(path):
+            seen.add(path)
+            candidates.append(path)
+
+    which_ts = shutil.which("TotalSegmentator")
+    if which_ts:
+        _add(which_ts)
+
+    script_dirs: list[str] = []
+    for scheme in (None, "nt_user", "posix_user"):
+        try:
+            path = (
+                sysconfig.get_path("scripts")
+                if scheme is None
+                else sysconfig.get_path("scripts", scheme)
+            )
+        except (KeyError, TypeError, ValueError):
+            path = None
+        if path:
+            script_dirs.append(path)
+
+    # pip --user on Windows often lands here even when nt_user is odd.
+    try:
+        import site
+
+        user_base = getattr(site, "USER_BASE", None) or ""
+        if user_base:
+            script_dirs.append(os.path.join(user_base, "Scripts"))
+            script_dirs.append(os.path.join(user_base, "bin"))
+    except ImportError:
+        pass
+
+    for scripts_dir in script_dirs:
+        for name in names:
+            _add(os.path.join(scripts_dir, name))
+    return candidates
+
+
+def _total_segmentator_launch_command() -> list[str]:
+    """Prefer TotalSegmentator console script; else ``-m totalsegmentator.bin.TotalSegmentator``.
+
+    Note: ``python -m totalsegmentator`` fails — the package has no ``__main__``.
+    """
     python_slicer = shutil.which("PythonSlicer")
-    if not python_slicer:
-        _status_error("Segmentation failed: PythonSlicer not found on PATH")
-        return None
+    ts_scripts = _total_segmentator_script_candidates()
 
-    scripts_dir = sysconfig.get_path("scripts")
-    ts_script = os.path.join(
-        scripts_dir, _ts_executable_name("TotalSegmentator")
-    )
-    if not os.path.isfile(ts_script):
-        _status_error(
-            "Segmentation failed: TotalSegmentator CLI not installed"
-        )
-        _debug_error(
-            "CLI not found at %s (install TotalSegmentator extension)",
-            ts_script,
-        )
-        return None
+    if python_slicer and ts_scripts:
+        return [python_slicer, ts_scripts[0]]
+    if ts_scripts:
+        # Console script shebang/wrapper already targets the install's Python.
+        return [ts_scripts[0]]
 
-    return [python_slicer, ts_script]
+    # Module path used by setuptools entry point TotalSegmentator=...:main
+    module = "totalsegmentator.bin.TotalSegmentator"
+    if python_slicer:
+        return [python_slicer, "-m", module]
+    return [sys.executable, "-m", module]
 
 
 def _total_segmentator_cli_options(
-    input_path: Path, output_path: Path, device: str, hub_event: str
+    input_path: Path,
+    output_path: Path,
+    device: str,
+    hub_event: str,
+    task: str = TS_TASK,
+    fast: bool = TS_FAST,
 ) -> list[str]:
+    del hub_event  # inbound event only stages input; output is always DICOM SEG
     options = [
         "-i",
         str(input_path.resolve()),
         "-o",
         str(output_path.resolve()),
         "--task",
-        TS_TASK,
+        task or TS_TASK,
+        "-ot",
+        "dicom_seg",
         "-d",
         device,
         "-nr",
@@ -655,16 +741,45 @@ def _total_segmentator_cli_options(
         "-ns",
         "1",
     ]
-    if hub_event == _DICOM_SEND_EVENT:
-        options.extend(["-ot", "dicom"])
-    if TS_MULTILABEL:
-        options.append("--ml")
-    if TS_FAST:
+    if fast:
         options.append("--fast")
     return options
 
 
-def _log_subprocess_output(proc: Any) -> None:
+class TotalSegFastUnsupportedError(RuntimeError):
+    """TotalSegmentator exited because ``--fast`` is not allowed for the task."""
+
+
+class TotalSegEmptySegmentsError(RuntimeError):
+    """TotalSegmentator finished but DICOM SEG had no non-empty segments to save."""
+
+
+def _status_line_is_traceback_noise(text: str) -> bool:
+    """Skip Python traceback framing in user-facing job status (keep console print)."""
+    s = text.strip()
+    if not s:
+        return True
+    if s == "Traceback (most recent call last):":
+        return True
+    if s.startswith('File "') or s.startswith("File '"):
+        return True
+    if s.startswith("~") or set(s) <= {"^", "~", " "}:
+        return True
+    if s.startswith("...") and "lines" in s:
+        return True
+    # Indented traceback continuation / caret lines
+    if text.startswith("    ") or text.startswith("  File "):
+        return True
+    # Raw empty-SEG exception — replaced by a clearer _status_error below
+    if "No non-empty segments found to save" in s:
+        return True
+    if s.startswith("ValueError:") or s.startswith("CalledProcessError:"):
+        return True
+    return False
+
+
+def _log_subprocess_output(proc: Any) -> str:
+    chunks: list[str] = []
     while True:
         try:
             line = proc.stdout.readline()
@@ -676,8 +791,20 @@ def _log_subprocess_output(proc: Any) -> None:
             "utf-8", errors="replace"
         ).rstrip()
         if text:
+            chunks.append(text)
             print(text)
-            _status_log_line(text)
+            if not _status_line_is_traceback_noise(text):
+                _status_log_line(text)
+    return "\n".join(chunks)
+
+
+def _totalsegmentator_subprocess_env() -> Dict[str, str]:
+    """Env for TotalSegmentator CLI — quiet noisy third-party FutureWarnings in job logs."""
+    env = os.environ.copy()
+    quiet = "ignore::FutureWarning"
+    existing = (env.get("PYTHONWARNINGS") or "").strip()
+    env["PYTHONWARNINGS"] = f"{existing},{quiet}" if existing else quiet
+    return env
 
 
 def _run_totalsegmentator_subprocess(
@@ -695,41 +822,82 @@ def _run_totalsegmentator_subprocess(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=_totalsegmentator_subprocess_env(),
     )
-    _log_subprocess_output(proc)
+    output = _log_subprocess_output(proc)
     proc.wait()
     if proc.returncode != 0:
+        if "does not work with option --fast" in output:
+            raise TotalSegFastUnsupportedError(
+                "task does not work with option --fast"
+            )
+        if "No non-empty segments found to save" in output:
+            raise TotalSegEmptySegmentsError(
+                "No non-empty segments found to save"
+            )
         raise CalledProcessError(proc.returncode, cmd)
     return True
 
 
 def _run_totalsegmentator(
-    input_path: Path, output_dir: Path, hub_event: str
+    input_path: Path,
+    output_dir: Path,
+    hub_event: str,
+    task: str = TS_TASK,
+    fast: bool = TS_FAST,
 ) -> Optional[Path]:
     command = _total_segmentator_launch_command()
-    if not command:
-        return None
+    _debug_log("TotalSegmentator launch: %s", " ".join(command))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = _cli_output_path(output_dir, hub_event)
+    use_fast = bool(fast)
 
     for device in ("gpu", "cpu"):
         try:
-            started = time.monotonic()
-            options = _total_segmentator_cli_options(
-                input_path, output_path, device, hub_event
-            )
-            _run_totalsegmentator_subprocess(command, options)
+            while True:
+                started = time.monotonic()
+                options = _total_segmentator_cli_options(
+                    input_path,
+                    output_path,
+                    device,
+                    hub_event,
+                    task=task,
+                    fast=use_fast,
+                )
+                try:
+                    _run_totalsegmentator_subprocess(command, options)
+                except TotalSegFastUnsupportedError:
+                    if not use_fast:
+                        raise
+                    _status_log(
+                        "Task %s does not support --fast; retrying without fast…",
+                        task,
+                    )
+                    _debug_log(
+                        "retry without --fast task=%s device=%s", task, device
+                    )
+                    use_fast = False
+                    if output_dir.is_dir():
+                        for entry in output_dir.iterdir():
+                            if entry.is_file():
+                                entry.unlink()
+                            elif entry.is_dir():
+                                shutil.rmtree(entry, ignore_errors=True)
+                    continue
+                break
+
             elapsed = time.monotonic() - started
             _status_log(
                 "Segmentation finished (%s, %.0fs)", device, elapsed
             )
             _debug_log(
-                "finished device=%s in %.1fs hub.event=%s output=%s",
+                "finished device=%s in %.1fs hub.event=%s output=%s fast=%s",
                 device,
                 elapsed,
                 hub_event,
                 output_path,
+                use_fast,
             )
             result = _find_segmentation_output(output_dir, hub_event, output_path)
             if result:
@@ -740,6 +908,28 @@ def _run_totalsegmentator(
                 hub_event,
                 output_dir,
             )
+        except TotalSegEmptySegmentsError:
+            _status_error(
+                "No segmentation to save for task=%s — the model found no "
+                "non-empty structures on this series (try task=total, or a "
+                "different study/FOV).",
+                task,
+            )
+            _debug_error(
+                "empty DICOM SEG task=%s device=%s (job dir: %s)",
+                task,
+                device,
+                output_dir,
+            )
+            return None
+        except FileNotFoundError as exc:
+            _status_error(
+                "Segmentation failed: TotalSegmentator not found "
+                "(install package or put PythonSlicer on PATH): %s",
+                exc,
+            )
+            _debug_error("launch not found: %s", exc)
+            return None
         except Exception as exc:
             _status_error("Segmentation failed (%s): %s", device, exc)
             _debug_error("failed device=%s: %s", device, exc)
@@ -751,64 +941,164 @@ def _run_totalsegmentator(
                         shutil.rmtree(entry, ignore_errors=True)
     return None
 
-
 def _find_segmentation_output(
     output_dir: Path, hub_event: str, expected_path: Path
 ) -> Optional[Path]:
+    del hub_event
     if expected_path.is_file():
         return expected_path
-    if hub_event == _NIFTI_SEND_EVENT:
-        return _find_output_nifti(output_dir)
     return _find_output_dicom(output_dir)
-
-
-def _find_output_nifti(output_dir: Path) -> Optional[Path]:
-    primary = output_dir / OUTPUT_NIFTI_NAME
-    if primary.is_file():
-        return primary
-    candidates = sorted(
-        path
-        for path in output_dir.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in (".gz", ".nii", ".nhdr", ".nrrd")
-        and "input" not in path.parts
-    )
-    if not candidates:
-        _debug_error(
-            "no NIfTI under %s (contents: %s)",
-            output_dir,
-            list(output_dir.rglob("*"))[:20],
-        )
-        return None
-    if len(candidates) > 1:
-        _debug_log(
-            "multiple NIfTI outputs, using %s (all: %s)",
-            candidates[0],
-            [str(p) for p in candidates],
-        )
-    return candidates[0]
 
 
 def _find_output_dicom(output_dir: Path) -> Optional[Path]:
     primary = output_dir / OUTPUT_DICOM_NAME
     if primary.is_file():
         return primary
-    candidates = [
+    candidates = sorted(
         path
-        for path in output_dir.rglob("*.dcm")
-        if path.is_file() and "input" not in path.parts
-    ]
+        for path in output_dir.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in (".dcm", ".dicom")
+        and "input" not in path.parts
+    )
     if not candidates:
         _debug_error(
-            "no .dcm under %s (contents: %s)",
+            "no DICOM SEG under %s (contents: %s)",
             output_dir,
             list(output_dir.rglob("*"))[:20],
         )
         return None
     if len(candidates) > 1:
         _debug_log(
-            "multiple .dcm outputs, using %s (all: %s)",
+            "multiple DICOM outputs, using %s (all: %s)",
             candidates[0],
             [str(p) for p in candidates],
         )
     return candidates[0]
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI (resource_server.run_sync) — Slicer onMessage path unchanged
+# ---------------------------------------------------------------------------
+
+
+def _context_files(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    event = message.get("event") or {}
+    ctx = event.get("context")
+    if isinstance(ctx, dict):
+        files = ctx.get("files")
+        if isinstance(files, list):
+            return [entry for entry in files if isinstance(entry, dict)]
+    return []
+
+
+def _ensure_job_status_context(
+    topic: str, product_name: str, target_subscriber: str
+) -> None:
+    """Start a job once; reuse if ``on_send_download_start`` already started it."""
+    ctx = _job_status_context
+    if (
+        ctx.get("topic") == topic
+        and ctx.get("product_name") == product_name
+        and ctx.get("job_number")
+    ):
+        _job_status_context["target_subscriber"] = (target_subscriber or "").strip()
+        return
+    _start_job(topic, product_name, target_subscriber)
+
+
+def on_send_download_start(
+    ctx: Any, message: Dict[str, Any], hub_event: str
+) -> None:
+    """Early status-update before the framework finishes downloading payloads."""
+    event = message.get("event") or {}
+    topic = (event.get("hub.topic") or "").strip()
+    target_subscriber = str(message.get("subscriber.name") or "").strip()
+    product_name = getattr(ctx, "product_name", "") or DEFAULT_PRODUCT_NAME
+    if not topic:
+        return
+    _ensure_job_status_context(topic, product_name, target_subscriber)
+    files = _context_files(message)
+    _status_log(_format_download_started(files if files else []))
+
+
+def _handle_standalone_send(
+    ctx: Any,
+    message: Dict[str, Any],
+    input_dir: Path,
+    file_count: int,
+    total_bytes: int,
+    hub_event: str,
+) -> None:
+    global _job_busy
+    event = message.get("event") or {}
+    topic = (event.get("hub.topic") or "").strip()
+    if not topic:
+        _debug_error("standalone %s missing hub.topic", hub_event)
+        return
+
+    product_name = getattr(ctx, "product_name", "") or DEFAULT_PRODUCT_NAME
+    target_subscriber = str(message.get("subscriber.name") or "").strip()
+    _ensure_job_status_context(topic, product_name, target_subscriber)
+    _job_busy = True
+    try:
+        if file_count < 1:
+            _status_error("Download failed: no %s payload received", hub_event)
+            return
+        files = _context_files(message)
+        _status_log(_format_download_complete(files, file_count, total_bytes))
+        job_dir = input_dir.parent
+        job_output = job_dir / "output"
+        job_output.mkdir(parents=True, exist_ok=True)
+        _run_segmentation_job_body(
+            topic,
+            product_name,
+            input_dir,
+            job_output,
+            job_dir,
+            hub_event,
+            message.get("event") if isinstance(message.get("event"), dict) else {},
+        )
+    finally:
+        _job_busy = False
+        _status_job_finished()
+        _clear_job_status_context()
+
+
+def on_dicom_send(
+    ctx: Any,
+    message: Dict[str, Any],
+    input_dir: Path,
+    file_count: int,
+    total_bytes: int,
+) -> None:
+    _handle_standalone_send(
+        ctx, message, input_dir, file_count, total_bytes, _DICOM_SEND_EVENT
+    )
+
+
+def on_nifti_send(
+    ctx: Any,
+    message: Dict[str, Any],
+    input_dir: Path,
+    file_count: int,
+    total_bytes: int,
+) -> None:
+    _handle_standalone_send(
+        ctx, message, input_dir, file_count, total_bytes, _NIFTI_SEND_EVENT
+    )
+
+
+if __name__ == "__main__":
+    from resource_server import ResourceServerConfig, ResourceServerHandlers, run_sync
+
+    HANDLERS = ResourceServerHandlers(
+        on_dicom_send=on_dicom_send,
+        on_nifti_send=on_nifti_send,
+        on_send_download_start=on_send_download_start,
+        build_status_response=build_status_response,
+    )
+    run_sync(
+        ResourceServerConfig(product_name=DEFAULT_PRODUCT_NAME),
+        HANDLERS,
+    )

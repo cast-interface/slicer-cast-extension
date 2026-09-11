@@ -2393,9 +2393,6 @@
         }
 
         async function clearAuditLog() {
-            if (!confirm('Clear all message log entries?')) {
-                return;
-            }
             try {
                 const res = await fetch('/api/hub/admin/clear-audit-log', { method: 'POST' });
                 if (!res.ok) {

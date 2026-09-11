@@ -769,6 +769,13 @@ async def _quiet_hub_uvicorn_access_logs() -> None:
     asyncio.create_task(_http_payload_reaper())
 
 
+@app.on_event("shutdown")
+async def _shutdown_close_websockets() -> None:
+    """Close subscriber/admin WebSockets so uvicorn can exit on Ctrl+C."""
+    cast_hub_logger.info("Cast hub shutting down: closing WebSocket connections")
+    await cast_hub.reset_all()
+
+
 # Trust reverse-proxy forwarded headers (Azure App Service) before CORS.
 _proxy_trusted_hosts = os.environ.get("CAST_HUB_PROXY_TRUSTED_HOSTS", "*").strip() or "*"
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=_proxy_trusted_hosts)
@@ -3911,6 +3918,9 @@ async def websocket_endpoint(websocket: WebSocket, endpoint: str):
                 cast_hub.log(f"WebSocket {endpoint}: non-JSON ({len(data)} bytes): {preview}")
     except WebSocketDisconnect:
         cast_hub.log(f"WebSocket disconnected for endpoint: {endpoint}")
+    except asyncio.CancelledError:
+        cast_hub.log(f"WebSocket cancelled (shutdown) for endpoint: {endpoint}")
+        raise
     except Exception as e:
         cast_hub.log(f"WebSocket error for endpoint {endpoint}: {type(e).__name__}: {e}")
         # Send admin refresh on error
@@ -3988,6 +3998,9 @@ async def admin_websocket_endpoint(websocket: WebSocket):
                 )
     except WebSocketDisconnect:
         cast_hub.log("Admin WebSocket disconnected", level=logging.DEBUG)
+    except asyncio.CancelledError:
+        cast_hub.log("Admin WebSocket cancelled (shutdown)", level=logging.DEBUG)
+        raise
     except Exception as e:
         cast_hub.log(
             f"Admin WebSocket error: {type(e).__name__}: {e}",
@@ -4286,10 +4299,9 @@ def main():
     print("=" * 60)
     
     # Run the server
-    # Note: On Windows, if Ctrl+C doesn't work:
+    # Note: On Windows, if Ctrl+C still hangs after shutdown closes sockets:
     #   - Press Ctrl+C twice (second press forces interrupt)
     #   - Use Ctrl+Break instead
-    #   - Close the terminal window
     #   - Or use: taskkill /F /PID <process_id>
     try:
         uvicorn.run(
@@ -4300,6 +4312,7 @@ def main():
             ws_max_size=None,
             ws_ping_interval=CAST_HUB_UVICORN_WS_PING_INTERVAL,
             ws_ping_timeout=CAST_HUB_UVICORN_WS_PING_TIMEOUT,
+            timeout_graceful_shutdown=5,
         )
     except KeyboardInterrupt:
         print("\n[LOG] Server stopped by user")
