@@ -71,7 +71,7 @@ from email import policy
 from email.parser import BytesParser
 from typing import Dict, List, Optional, Any, Set, Tuple
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 # cast_hub.py is run as a script (see module docstring), so sibling imports
 # are the right form here.
@@ -115,7 +115,7 @@ from oauth_tokens import (
     verify_hs256_jwt,
 )
 from idc_index_service import resolve_study_series_files
-from idc_mcp_anthropic import (
+from idc_nl_anthropic import (
     anthropic_configured,
     env_idc_mcp_upstream_url,
     search_idc_via_anthropic,
@@ -1796,6 +1796,103 @@ async def get_hub_sample_file(study_id: str, file_name: str):
     return FileResponse(file_path, media_type=media_type)
 
 
+# Browser clients cannot fetch GitHub release assets (no CORS). IRA and other
+# Image Displays use this allowlisted proxy for remote NIfTI/NRRD opens.
+_PROXY_DOWNLOAD_ALLOWED_HOSTS = frozenset(
+    {
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    }
+)
+
+
+def _proxy_download_host_allowed(hostname: str) -> bool:
+    host = str(hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in _PROXY_DOWNLOAD_ALLOWED_HOSTS:
+        return True
+    # Allow githubusercontent CDN subdomains used by release redirects.
+    return host.endswith(".githubusercontent.com")
+
+
+@app.get("/api/hub/proxy-download")
+@app.get("/api/hub/proxy-download/")
+async def proxy_download(request: Request, url: str = ""):
+    """Stream an allowlisted remote file for browser Image Displays (CORS bridge)."""
+    target = str(url or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="Missing url query parameter")
+    try:
+        parsed = urlparse(target)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid url: {exc}") from exc
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="url must be http(s)")
+    if not _proxy_download_host_allowed(parsed.hostname or ""):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Host not allowlisted for proxy-download: {parsed.hostname}",
+        )
+
+    timeout = aiohttp.ClientTimeout(total=600)
+    try:
+        session = aiohttp.ClientSession(timeout=timeout)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Failed to create HTTP client: {exc}"
+        ) from exc
+
+    try:
+        upstream = await session.get(target, allow_redirects=True)
+    except Exception as exc:
+        await session.close()
+        raise HTTPException(
+            status_code=502, detail=f"Upstream fetch failed: {exc}"
+        ) from exc
+
+    final_host = urlparse(str(upstream.url)).hostname or ""
+    if not _proxy_download_host_allowed(final_host):
+        upstream.close()
+        await session.close()
+        raise HTTPException(
+            status_code=403,
+            detail=f"Redirect host not allowlisted: {final_host}",
+        )
+
+    if upstream.status >= 400:
+        body = await upstream.text()
+        upstream.close()
+        await session.close()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream HTTP {upstream.status}: {body[:200]}",
+        )
+
+    media_type = (
+        upstream.headers.get("Content-Type")
+        or "application/octet-stream"
+    )
+    headers = {}
+    content_length = upstream.headers.get("Content-Length")
+    if content_length:
+        headers["Content-Length"] = content_length
+    content_disp = upstream.headers.get("Content-Disposition")
+    if content_disp:
+        headers["Content-Disposition"] = content_disp
+
+    async def _stream():
+        try:
+            async for chunk in upstream.content.iter_chunked(64 * 1024):
+                yield chunk
+        finally:
+            upstream.close()
+            await session.close()
+
+    return StreamingResponse(_stream(), media_type=media_type, headers=headers)
+
+
 IDC_MCP_UPSTREAM_DEFAULT = (
     "https://api.imaging.datacommons.cancer.gov/mcp"
 )
@@ -1878,20 +1975,25 @@ async def post_hub_idc_series_files(request: Request):
     return result
 
 
+@app.get("/api/hub/idc-nl/status")
+@app.get("/api/hub/idc-nl/status/")
 @app.get("/api/hub/idc-mcp/status")
 @app.get("/api/hub/idc-mcp/status/")
-async def get_hub_idc_mcp_status():
-    """Report IDC MCP + Anthropic search availability for worklist clients."""
+async def get_hub_idc_nl_status():
+    """Report Anthropic NL → SearchQuery availability for worklist clients."""
     return {
         "anthropic": anthropic_configured(),
+        # Legacy field for older clients / MCP proxy URL display.
         "idcMcpUrl": env_idc_mcp_upstream_url(),
     }
 
 
+@app.post("/api/hub/idc-nl/search")
+@app.post("/api/hub/idc-nl/search/")
 @app.post("/api/hub/idc-mcp/search")
 @app.post("/api/hub/idc-mcp/search/")
-async def post_hub_idc_mcp_search(request: Request):
-    """Natural-language IDC cohort search via Anthropic MCP connector."""
+async def post_hub_idc_nl_search(request: Request):
+    """NL → SearchQuery JSON via Anthropic (client executes against IDC REST)."""
     if not anthropic_configured():
         raise HTTPException(
             status_code=503,
@@ -1930,16 +2032,20 @@ async def post_hub_idc_mcp_search(request: Request):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger = logging.getLogger("cast_hub")
-        logger.exception("idc-mcp anthropic search failed")
+        logger.exception("idc-nl anthropic search failed")
         raise HTTPException(
             status_code=502,
-            detail=f"Anthropic IDC MCP search failed: {exc}",
+            detail=f"Anthropic IDC search failed: {exc}",
         ) from exc
 
+    query = result.get("query") if isinstance(result, dict) else {}
+    query_type = ""
+    if isinstance(query, dict):
+        query_type = str(query.get("queryType") or "")
     logging.getLogger("cast_hub").info(
-        "idc-mcp anthropic search prompt_len=%d series=%d elapsed=%.0fms",
+        "idc-nl anthropic nl-query prompt_len=%d queryType=%s elapsed=%.0fms",
         len(prompt),
-        len(result.get("series") or []),
+        query_type or "?",
         (time.time() - started) * 1000,
     )
     return result
@@ -3249,7 +3355,7 @@ async def _parse_binary_batch_publish(request: Request) -> tuple:
             status_code=400,
             detail=(
                 "binary batch publish publish is only supported for binary-family events "
-                "(hub.event starting with dicom, nifti, jpg, png, or nrrd)"
+                "(hub.event starting with dicom, nifti, jpg, png, nrrd, or imagingstudy)"
             ),
         )
 

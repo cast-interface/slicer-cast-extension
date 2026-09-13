@@ -6,7 +6,7 @@ from Lib.repo_paths import ensure_monorepo_import_paths
 
 ensure_monorepo_import_paths()
 
-import qt
+import ctk
 
 from slicer.i18n import tr as _
 from slicer.ScriptedLoadableModule import (
@@ -53,22 +53,6 @@ class CastInterface(ScriptedLoadableModule):
         )
 
 
-_COLLAPSIBLE_SECTION_STYLE = """
-QGroupBox {
-  border: 2px solid palette(mid);
-  border-radius: 6px;
-  margin-top: 14px;
-  padding: 12px 10px 10px 10px;
-}
-QGroupBox::title {
-  subcontrol-origin: margin;
-  subcontrol-position: top left;
-  padding: 2px 8px;
-  left: 8px;
-}
-"""
-
-
 class CastInterfaceWidget(ScriptedLoadableModuleWidget):
     def __init__(self, parent=None) -> None:
         ScriptedLoadableModuleWidget.__init__(self, parent)
@@ -77,40 +61,31 @@ class CastInterfaceWidget(ScriptedLoadableModuleWidget):
         self.hubWidget = CastHubWidget()
 
     @staticmethod
-    def _collapsible_group_box(
-        title: str, *, expanded: bool = True
-    ) -> tuple[qt.QGroupBox, qt.QWidget]:
-        section = qt.QGroupBox(title)
-        section.setStyleSheet(_COLLAPSIBLE_SECTION_STYLE)
-        section.setCheckable(True)
-        section.setChecked(expanded)
-        inner = qt.QWidget()
-        outer = qt.QVBoxLayout(section)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(inner)
-        inner.setVisible(expanded)
-        section.toggled.connect(inner.setVisible)
-        return section, inner
+    def _ctk_collapsible_section(title: str, *, expanded: bool = True):
+        section = ctk.ctkCollapsibleButton()
+        section.text = title
+        section.collapsed = not expanded
+        return section
 
     def setup(self) -> None:
         ScriptedLoadableModuleWidget.setup(self)
         self.layout.setSpacing(10)
 
-        hubSection, hubInner = self._collapsible_group_box(_("Hub"), expanded=True)
-        self.layout.addWidget(hubSection)
-        self.hubWidget.setup(hubInner)
-
-        resourceServersSection, resourceServersInner = self._collapsible_group_box(
-            _("Resource Servers"), expanded=True
-        )
-        self.layout.addWidget(resourceServersSection)
-        self.resourceServersWidget.setup(resourceServersInner)
-
-        clientSection, clientInner = self._collapsible_group_box(
-            _("Image Display Client"), expanded=False
+        clientSection = self._ctk_collapsible_section(
+            _("Image Display Client"), expanded=True
         )
         self.layout.addWidget(clientSection)
-        self.imageDisplayClientWidget.setup(clientInner)
+        self.imageDisplayClientWidget.setup(clientSection)
+
+        hubSection = self._ctk_collapsible_section(_("Hub"), expanded=False)
+        self.layout.addWidget(hubSection)
+        self.hubWidget.setup(hubSection)
+
+        resourceServersSection = self._ctk_collapsible_section(
+            _("Resource Servers"), expanded=False
+        )
+        self.layout.addWidget(resourceServersSection)
+        self.resourceServersWidget.setup(resourceServersSection)
 
         self.layout.addStretch(1)
 
