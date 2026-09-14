@@ -36,6 +36,7 @@ DISPLAY_EVENTS = [
     "imagingstudy-open",
     "imagingstudy-close",
     "status-request",
+    "livescene-request",
     "annotation-update",
     "annotation-delete",
 ]
@@ -213,6 +214,9 @@ class ImageDisplayClientConnection:
 
     def get_product_name(self) -> str:
         return (self._product_name or "").strip() or DISPLAY_PRODUCT_NAME
+
+    def get_topic(self) -> str:
+        return (self._topic or "").strip()
 
     def get_client(self) -> Optional[SlicerCastClient]:
         return self._client

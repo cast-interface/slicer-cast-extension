@@ -25,7 +25,9 @@ _DEFAULT_DISPLAY_PRODUCT_NAME = "3DSLICER-ID"
 EMPTY_FHIRCAST_CONTEXT: Dict[str, Any] = {"context.type": "", "context": []}
 ID_ACTOR_KEYWORD = "ID"
 STATUS_DATA_TYPE = "STATUS"
+LIVESCENE_DATA_TYPE = "LIVESCENE"
 SCENEVIEW_BUILD_TIMEOUT_SECONDS = 9.0
+LIVESCENE_EXPORT_TIMEOUT_SECONDS = 120.0
 
 
 def _normalize_target_actor(value: Any) -> str:
@@ -101,18 +103,31 @@ async def handle_status_request(
     product_name = _resolve_product_name(connection)
     open_context = connection.get_last_open_context()
 
-    def build_sceneview(*, fast_placeholder_thumbnails: bool = False) -> Dict[str, Any]:
+    def build_status_payload(
+        *, fast_placeholder_thumbnails: bool = False
+    ) -> Dict[str, Any]:
         from build_sceneview_response import build_sceneview_response_payload
+        from local_dicom_worklist import list_local_dicom_worklist_studies
+        from live_scene_export import live_scene_status_study_row
 
-        return build_sceneview_response_payload(
+        sceneview = build_sceneview_response_payload(
             product_name,
             open_context,
             fast_placeholder_thumbnails=fast_placeholder_thumbnails,
         )
+        studies = [live_scene_status_study_row()]
+        studies.extend(list_local_dicom_worklist_studies())
+        return {
+            "source": "status",
+            "product": product_name,
+            "items": [{"key": "availability", "value": "online"}],
+            "sceneview": sceneview,
+            "studies": studies,
+        }
 
     try:
-        sceneview = await asyncio.wait_for(
-            connection.run_on_main_thread(lambda: build_sceneview()),
+        payload = await asyncio.wait_for(
+            connection.run_on_main_thread(lambda: build_status_payload()),
             timeout=SCENEVIEW_BUILD_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
@@ -120,27 +135,24 @@ async def handle_status_request(
             "status sceneview build timed out after %.0fs; sending placeholder thumbnails",
             SCENEVIEW_BUILD_TIMEOUT_SECONDS,
         )
-        sceneview = await connection.run_on_main_thread(
-            lambda: build_sceneview(fast_placeholder_thumbnails=True)
+        payload = await connection.run_on_main_thread(
+            lambda: build_status_payload(fast_placeholder_thumbnails=True)
         )
 
-    payload = {
-        "source": "status",
-        "product": product_name,
-        "items": [{"key": "availability", "value": "online"}],
-        "sceneview": sceneview,
-    }
     client.send_cast_request_response(
         correlation_id,
         STATUS_DATA_TYPE,
         payload,
         _topic_from_message(message),
     )
+    sceneview = payload.get("sceneview") if isinstance(payload, dict) else {}
     viewports = sceneview.get("viewports") if isinstance(sceneview, dict) else []
+    studies = payload.get("studies") if isinstance(payload, dict) else []
     LOGGER.info(
-        "sent status-response id=%s viewportCount=%d",
+        "sent status-response id=%s viewportCount=%d studyCount=%d",
         correlation_id,
         len(viewports) if isinstance(viewports, list) else 0,
+        len(studies) if isinstance(studies, list) else 0,
     )
 
 
@@ -177,8 +189,77 @@ async def handle_cast_request(
         await handle_status_request(connection, client, message)
         return
 
+    if normalized == normalize_data_type(LIVESCENE_DATA_TYPE):
+        await handle_livescene_request(connection, client, message)
+        return
+
     LOGGER.debug(
         "Ignoring unsupported request event=%s dataType=%s",
         hub_event,
         data_type,
     )
+
+
+async def handle_livescene_request(
+    connection: "ImageDisplayClientConnection",
+    client: "SlicerCastClient",
+    message: Dict[str, Any],
+) -> None:
+    """Export current MRML LiveScene and publish ImagingStudy-open (multipart blobs)."""
+    correlation_id = _request_correlation_id(message)
+    topic = _topic_from_message(message) or connection.get_topic() or ""
+
+    def export_on_main() -> tuple:
+        from live_scene_export import (
+            build_livescene_imaging_study_open_message,
+            export_live_scene_document,
+        )
+
+        scene_doc, blob_parts = export_live_scene_document()
+        msg = build_livescene_imaging_study_open_message(
+            topic=str(topic or ""),
+            scene_doc=scene_doc,
+            blob_parts=blob_parts,
+        )
+        return msg, len(scene_doc.get("nodes") or {}), len(blob_parts)
+
+    try:
+        cast_message, node_count, blob_count = await asyncio.wait_for(
+            connection.run_on_main_thread(export_on_main),
+            timeout=LIVESCENE_EXPORT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        LOGGER.warning("LiveScene export failed: %s", exc)
+        if correlation_id:
+            client.send_cast_request_response(
+                correlation_id,
+                LIVESCENE_DATA_TYPE,
+                {
+                    "source": "livescene",
+                    "ok": False,
+                    "error": str(exc).strip() or exc.__class__.__name__,
+                },
+                _topic_from_message(message),
+            )
+        return
+
+    status = await client.publish(cast_message)
+    LOGGER.info(
+        "livescene-request: published ImagingStudy-open nodes=%d blobs=%d http=%s",
+        node_count,
+        blob_count,
+        status,
+    )
+    if correlation_id:
+        client.send_cast_request_response(
+            correlation_id,
+            LIVESCENE_DATA_TYPE,
+            {
+                "source": "livescene",
+                "ok": True,
+                "product": _resolve_product_name(connection),
+                "nodeCount": node_count,
+                "blobCount": blob_count,
+            },
+            _topic_from_message(message),
+        )

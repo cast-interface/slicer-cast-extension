@@ -19,6 +19,7 @@ from imaging_study_context import (
     CAST_OPEN_MODE_DICOMWEB,
     CAST_OPEN_MODE_FILES,
     CAST_OPEN_MODE_IDC,
+    CAST_OPEN_MODE_LOCAL_DICOM,
     CastFileEntry,
     ImagingStudyOpenPlan,
     resolve_imaging_study_open_plan,
@@ -467,6 +468,45 @@ def force_image_display_render() -> None:
         LOGGER.warning("Image Display force render failed: %s", exc)
 
 
+def load_local_dicom_study(plan: ImagingStudyOpenPlan) -> Dict[str, Any]:
+    """Load a study already present in ``slicer.dicomDatabase`` by StudyInstanceUID."""
+    study_uid = str(plan.get("study_uid") or "").strip()
+    if not study_uid:
+        raise RuntimeError("local-dicom open requires a DICOM study UID")
+
+    _require_dicom_database()
+
+    file_paths: List[str] = []
+    try:
+        series_list = slicer.dicomDatabase.seriesForStudy(study_uid) or []
+    except Exception as exc:
+        raise RuntimeError(
+            f"local-dicom: study not found in DICOM database ({study_uid})"
+        ) from exc
+
+    if not series_list:
+        raise RuntimeError(
+            f"local-dicom: no series for study {study_uid} in DICOM database"
+        )
+
+    for series_id in series_list:
+        for instance in slicer.dicomDatabase.instancesForSeries(series_id) or []:
+            path = slicer.dicomDatabase.fileForInstance(instance)
+            if path:
+                file_paths.append(path)
+
+    loaded_node_ids = _load_dicom_paths(file_paths)
+    if not loaded_node_ids:
+        raise RuntimeError("local-dicom import did not load any nodes into the scene")
+
+    return {
+        "loaded_node_ids": loaded_node_ids,
+        "temp_dir": "",
+        "load_status": "loaded",
+        "error": "",
+    }
+
+
 def load_imaging_study_open(context: Any) -> Dict[str, Any]:
     plan = resolve_imaging_study_open_plan(context)
     if plan is None:
@@ -494,6 +534,8 @@ def load_imaging_study_open(context: Any) -> Dict[str, Any]:
             result = load_dicomweb_study_with_fallback(plan)
         elif mode == CAST_OPEN_MODE_IDC:
             result = load_idc_study(plan)
+        elif mode == CAST_OPEN_MODE_LOCAL_DICOM:
+            result = load_local_dicom_study(plan)
         else:
             raise RuntimeError(f"Unsupported open mode: {mode or '(empty)'}")
 

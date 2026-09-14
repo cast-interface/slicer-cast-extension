@@ -6,6 +6,5 @@
   "summary": "Whole-body CT/MR multi-organ segmentation (dicom-send / nifti-send jobs). Returns DICOM SEG via dicom-send.",
   "githubUrl": "https://github.com/wasserth/TotalSegmentator",
   "websiteUrl": "https://totalsegmentator.com/",
-  "buyMeACoffeeUrl": "https://buymeacoffee.com/totalsegmentator",
   "hubEvent": "dicom-send"
 }

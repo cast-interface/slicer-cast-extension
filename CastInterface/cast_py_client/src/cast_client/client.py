@@ -526,7 +526,7 @@ def coerce_binary_publish_to_files(msg: Dict[str, Any]) -> Dict[str, Any]:
 # for transport purposes. Keep this list byte-for-byte equivalent across the
 # four Cast implementations (vtk-js sendNormalize, Slicer cast_client, VolView
 # server cast_client, hub cast_api) per AGENTS.md section 2.
-_CAST_BINARY_EVENT_PREFIXES = ("dicom", "nifti", "jpg", "png", "nrrd")
+_CAST_BINARY_EVENT_PREFIXES = ("dicom", "nifti", "jpg", "png", "nrrd", "imagingstudy")
 
 
 def is_cast_binary_event(event_name: Any) -> bool:

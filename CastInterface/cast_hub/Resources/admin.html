@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>3D Slicer Cast Hub</title>
+    <title>3D Slicer Hub</title>
     <link rel="icon" id="app-favicon" type="image/png" href="/static/images/3DSlicer-DesktopIcon.png">
     <style>
         :root {
@@ -551,7 +551,7 @@
             display: block !important;
         }
         .header-title {
-            color: var(--accent);
+            color: var(--text-primary);
             font-weight: 400;
             line-height: 1.15;
         }
@@ -1082,11 +1082,11 @@
             window.addEventListener('blur', deactivateShiftPolka);
             const isSlicer = theme === '3dslicer';
             const HUB_PRODUCT_NAME = isSlicer
-                ? '3D Slicer Cast Hub'
+                ? '3D Slicer Hub'
                 : 'Server Cast API';
             const CAST_HEADER_LABEL = 'Cast Interface';
             document.title = isSlicer
-                ? '3D Slicer Cast Hub'
+                ? '3D Slicer Hub'
                 : 'VolView Server Cast API';
             const favicon = document.getElementById('app-favicon');
             if (favicon) {
@@ -1165,7 +1165,7 @@
             <div class="header-brand">
                 <img class="header-logo-volview" src="/static/images/volview-logo.svg" alt="VolView">
                 <img class="header-logo-slicer" src="/static/images/3DSlicer-DesktopIcon.png" alt="3D Slicer">
-                <span class="header-title">3D Slicer Cast Hub</span>
+                <span class="header-title">3D Slicer Hub</span>
             </div>
             <div class="header-actions">
                 <div class="metrics-row">
@@ -1819,6 +1819,10 @@
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 const data = await response.json();
+                // Ignore overlapping fetches that finished after a newer revision was applied.
+                if (data.revision != null && data.revision < lastRevision) {
+                    return;
+                }
                 if (data.revision != null) {
                     lastRevision = data.revision;
                 }
@@ -2660,10 +2664,10 @@
                             loadSnapshot();
                         } else if (message.type === 'connection.established') {
                             console.log('Admin connection established');
-                            if (message.revision != null) {
-                                lastRevision = message.revision;
-                            }
+                            // Reload dashboard — do not bump lastRevision alone or
+                            // changes while disconnected are skipped until the next event.
                             updateConnectionStatus(lastAdminClientCount);
+                            loadSnapshot();
                         } else if (message.type === 'ping') {
                             // Respond to ping with pong
                             adminWebSocket.send(JSON.stringify({ type: 'pong' }));
