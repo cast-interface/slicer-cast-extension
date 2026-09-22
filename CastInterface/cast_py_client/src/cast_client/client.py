@@ -526,7 +526,15 @@ def coerce_binary_publish_to_files(msg: Dict[str, Any]) -> Dict[str, Any]:
 # for transport purposes. Keep this list byte-for-byte equivalent across the
 # four Cast implementations (vtk-js sendNormalize, Slicer cast_client, VolView
 # server cast_client, hub cast_api) per AGENTS.md section 2.
-_CAST_BINARY_EVENT_PREFIXES = ("dicom", "nifti", "jpg", "png", "nrrd", "imagingstudy")
+_CAST_BINARY_EVENT_PREFIXES = (
+    "dicom",
+    "nifti",
+    "jpg",
+    "png",
+    "nrrd",
+    "imagingstudy",
+    "scene",  # scene-update (LiveSync HubBlobs multipart)
+)
 
 
 def is_cast_binary_event(event_name: Any) -> bool:
@@ -768,62 +776,102 @@ class _PayloadHttpConnectionPool:
         expected_length: Optional[int] = None,
     ) -> bytes:
         url = _normalize_loopback_url(url)
-        parsed = urlparse(url)
-        host = parsed.hostname
-        if not host:
-            raise ValueError(f"Cast http payload url missing host: {url!r}")
-        default_port = 443 if parsed.scheme == "https" else 80
-        port = parsed.port if parsed.port is not None else default_port
-        https = parsed.scheme == "https"
-        key = (host, port, https)
-        path = parsed.path or "/"
-        if parsed.query:
-            path = f"{path}?{parsed.query}"
+        current = url
+        # GitHub release assets (and similar CDNs) answer with 302; http.client
+        # does not follow redirects on its own.
+        max_redirects = 10
+        for redirect_count in range(max_redirects + 1):
+            parsed = urlparse(current)
+            host = parsed.hostname
+            if not host:
+                raise ValueError(f"Cast http payload url missing host: {current!r}")
+            default_port = 443 if parsed.scheme == "https" else 80
+            port = parsed.port if parsed.port is not None else default_port
+            https = parsed.scheme == "https"
+            key = (host, port, https)
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
 
-        holder = getattr(self._tls, "payload_http", None)
-        if holder is None or holder.key != key or holder.conn is None:
-            if holder is not None and holder.conn is not None:
-                try:
-                    holder.conn.close()
-                except OSError:
-                    pass
-            holder = _ThreadPayloadHttp(
-                key=key, conn=self._open_connection(host, port, https)
-            )
-            self._tls.payload_http = holder
-
-        headers: Dict[str, str] = {}
-        if bearer_token:
-            headers["Authorization"] = f"Bearer {bearer_token}"
-
-        conn = holder.conn
-        assert conn is not None
-        try:
-            conn.request("GET", path, headers=headers)
-            resp = conn.getresponse()
-            if resp.status != 200:
-                body = resp.read()
-                LOGGER.error(
-                    "Cast payload GET HTTP %s %s url=%s host=%s path=%s",
-                    resp.status,
-                    resp.reason,
-                    url,
-                    host,
-                    path,
+            holder = getattr(self._tls, "payload_http", None)
+            if holder is None or holder.key != key or holder.conn is None:
+                if holder is not None and holder.conn is not None:
+                    try:
+                        holder.conn.close()
+                    except OSError:
+                        pass
+                holder = _ThreadPayloadHttp(
+                    key=key, conn=self._open_connection(host, port, https)
                 )
-                raise urllib.error.HTTPError(
-                    url, resp.status, resp.reason, resp.headers, body
+                self._tls.payload_http = holder
+
+            headers: Dict[str, str] = {}
+            # Only send Cast bearer on the original URL; never to redirect targets
+            # (e.g. objects.githubusercontent.com after a GitHub release 302).
+            if bearer_token and current == url:
+                headers["Authorization"] = f"Bearer {bearer_token}"
+
+            conn = holder.conn
+            assert conn is not None
+            try:
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                if resp.status in (301, 302, 303, 307, 308):
+                    location = resp.getheader("Location") or ""
+                    try:
+                        resp.read()
+                    except OSError:
+                        pass
+                    self._close_tls_connection()
+                    if not location:
+                        raise urllib.error.HTTPError(
+                            current,
+                            resp.status,
+                            f"{resp.reason} (missing Location)",
+                            resp.headers,
+                            None,
+                        )
+                    next_url = urljoin(current, location)
+                    LOGGER.info(
+                        "Cast payload GET redirect %s -> %s",
+                        current,
+                        next_url,
+                    )
+                    current = next_url
+                    if redirect_count >= max_redirects:
+                        break
+                    continue
+                if resp.status != 200:
+                    body = resp.read()
+                    LOGGER.error(
+                        "Cast payload GET HTTP %s %s url=%s host=%s path=%s",
+                        resp.status,
+                        resp.reason,
+                        current,
+                        host,
+                        path,
+                    )
+                    raise urllib.error.HTTPError(
+                        current, resp.status, resp.reason, resp.headers, body
+                    )
+                _tune_http_client_socket(conn.sock)
+                return _read_http_payload_body(
+                    resp, current, expected_length=expected_length
                 )
-            _tune_http_client_socket(conn.sock)
-            return _read_http_payload_body(
-                resp, url, expected_length=expected_length
-            )
-        except (ConnectionError, OSError, urllib.error.HTTPError):
-            self._close_tls_connection()
-            raise
-        finally:
-            # Do not reuse sockets; idle closes cause WinError 10053 on large batches.
-            self._close_tls_connection()
+            except (ConnectionError, OSError, urllib.error.HTTPError):
+                self._close_tls_connection()
+                raise
+            finally:
+                # Do not reuse sockets; idle closes cause WinError 10053 on large batches.
+                self._close_tls_connection()
+
+        raise urllib.error.HTTPError(
+            current,
+            310,
+            f"too many redirects (>{max_redirects}) from {url}",
+            None,
+            None,
+        )
 
     def download_with_retry(
         self,
@@ -834,6 +882,9 @@ class _PayloadHttpConnectionPool:
         try:
             return self.download(url, bearer_token, expected_length)
         except (ConnectionError, OSError) as exc:
+            # urllib.error.HTTPError subclasses OSError — do not retry 4xx/3xx.
+            if isinstance(exc, urllib.error.HTTPError):
+                raise
             LOGGER.warning(
                 "Cast payload GET retry url=%s after %s: %s",
                 url,

@@ -10,6 +10,7 @@ CAST_OPEN_MODE_DICOMWEB = "dicomweb"
 CAST_OPEN_MODE_DICOM_URL = "dicom-url"
 CAST_OPEN_MODE_FILES = "files"
 CAST_OPEN_MODE_IDC = "idc"
+CAST_OPEN_MODE_LOCAL_DICOM = "local-dicom"
 
 CAST_IDENTIFIER_DICOM_UID = "urn:dicom:uid"
 CAST_IDENTIFIER_NIFTI_URL = "urn:cast:nifti-url"
@@ -267,6 +268,7 @@ def extract_open_mode(context: Any) -> str:
         CAST_OPEN_MODE_DICOM_URL,
         CAST_OPEN_MODE_FILES,
         CAST_OPEN_MODE_IDC,
+        CAST_OPEN_MODE_LOCAL_DICOM,
     ):
         return explicit
 

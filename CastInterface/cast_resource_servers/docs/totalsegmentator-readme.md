@@ -1,5 +1,20 @@
 # TotalSegmentator Cast resource server
 
+## Standalone CLI (no Slicer UI)
+
+From `CastInterface/` with a hub already listening (e.g. `--port 2018`):
+
+```bash
+pip install -e cast_py_client
+pip install aiohttp
+# Inference deps are operator-managed (TotalSegmentator / torch / highdicom), or use PythonSlicer on PATH
+python cast_resource_servers/products/total_segmentator.py --local
+```
+
+`--local` connects to `http://127.0.0.1:2018`. Omit it to use the default cloud hub.
+
+The CLI reuses the same job body as the Slicer **onMessage** path (`dicom-send` / `nifti-send` → status-update → result publish). Prefer the `TotalSegmentator` console script (including user `Scripts` dirs) or `PythonSlicer`; otherwise `python -m totalsegmentator.bin.TotalSegmentator` (not `-m totalsegmentator` — that package has no `__main__`). GPU/CUDA follows whichever Python runs the CLI. DICOM SEG output (`-ot dicom_seg`) requires **`highdicom`** in that same environment.
+
 ## Cast Interface setup
 
 In **Resource Servers**, add or edit a row:
@@ -54,16 +69,16 @@ stream in live. Non-VolView sends (empty requester) still log locally only.
 
 **Disconnect the AIBRAIN resource server** while testing TotalSegmentator. If both are connected, AIBRAIN immediately publishes the demo `ai-results-mrbrain.dcm` on every `dicom-send` (the Cast module now skips that when multiple resource servers are connected, but using one resource server avoids confusion).
 
-Requires the **TotalSegmentator** Slicer extension (Python package `totalsegmentator`) and `rt_utils` for DICOM RT Struct output.
+Requires the **TotalSegmentator** Slicer extension (Python package `totalsegmentator`) when using the Slicer path. For plain-Python CLI, install TotalSegmentator into that environment (not pinned in `cast_resource_servers/requirements.txt`). DICOM SEG output also needs **`highdicom`**.
 
-Inference runs in a **separate `PythonSlicer` process** (TotalSegmentator CLI), matching the Slicer extension. This avoids Windows nnU-Net multiprocessing failures inside the live Slicer GUI process.
+Inference runs in a **subprocess** (`TotalSegmentator` console script / `PythonSlicer` when available, else `python -m totalsegmentator.bin.TotalSegmentator`). That avoids Windows nnU-Net multiprocessing failures inside a live Slicer GUI process.
 
 ## Input expectations
 
-### `dicom-send` (VolView binary batch)
+### `dicom-send` (VolView / IRA binary batch)
 
-- VolView sends one **`dicom-send`** per study/series (or slice selection) with **`context.files[]`** and one DICOM body per file (`multipart/related` on `POST /api/hub/`).
-- The hub fans out metadata with **`payloadId`** per file; this script calls **`fetch_all_payloads`** before handling.
+- VolView/IRA sends one **`dicom-send`** per study/series (or slice selection) with **`context.files[]`** and one DICOM body per file (`multipart/related` on `POST /api/hub/`).
+- The hub fans out metadata with **`payloadId`** per file; bytes are streamed into the job `input/` directory before handling.
 - All files in the batch are staged under the **`hub.topic`** temp folder, then TotalSegmentator runs once (same pattern as `nifti-send`).
 - Send a **complete CT series** (many slices); a single slice is unlikely to work.
 
@@ -76,8 +91,9 @@ Inference runs in a **separate `PythonSlicer` process** (TotalSegmentator CLI), 
 
 ## Output
 
-- Uses TotalSegmentator `output_type="dicom"` (DICOM **RT Struct**), typically `segmentations.dcm`.
-- Publishes that file back on the **same hub topic** as a `dicom-send` event.
+- Always DICOM SEG (`-ot dicom_seg`), typically `segmentations.dcm` — including when the job arrived as `nifti-send`.
+- Requires **highdicom** in the TotalSegmentator Python environment.
+- Publishes that file back on the **same hub topic** as a **`dicom-send`** event (IRA reads SegmentSequence names / SNOMED / colors).
 
 ## Logs
 

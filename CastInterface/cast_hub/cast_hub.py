@@ -203,7 +203,7 @@ def _env_positive_int(name: str, default: int) -> int:
 # ``chunkByteLengths[]``. Subscribers GET ``/api/hub/payloads/{payloadId}``
 # when the application chooses to download.
 CAST_HUB_HTTP_PAYLOAD_TTL_SECONDS = _env_positive_int(
-    "CAST_HUB_HTTP_PAYLOAD_TTL_SECONDS", 300
+    "CAST_HUB_HTTP_PAYLOAD_TTL_SECONDS", 1800
 )
 # Soft cap on total in-flight payload bytes. If a registration would exceed
 # this, the hub strips the http marker and fans out metadata-only JSON.
@@ -804,6 +804,7 @@ SPA_CLIENTS = [
     ("worklist-client", "worklist-client"),
     ("reporting-client", "reporting-client"),
     ("slicerlive", "slicerlive"),
+    ("hub-mirror", "hub-mirror"),
     ("slim", "slim"),
     ("ohif", "OHIF-client"),
 ]
@@ -2243,6 +2244,7 @@ async def post_conference(request: Request):
 
     conference = {
         "hostTopic": host_topic,
+        "sceneLeaderTopic": host_topic,
         "title": title,
         "topics": attendee_topics,
     }
@@ -2259,6 +2261,7 @@ async def post_conference(request: Request):
         {
             "title": title,
             "hostTopic": host_topic,
+            "sceneLeaderTopic": host_topic,
             "hostUserName": host_user_name,
             "participants": subscriber_names,
         },
@@ -2268,6 +2271,72 @@ async def post_conference(request: Request):
     await cast_hub.send_admin_refresh_command()
 
     return {"status": "created", "conference": conference}
+
+
+@app.patch("/api/hub/conference/lead")
+@app.patch("/api/hub/conference/lead/")
+async def patch_conference_lead(request: Request):
+    """Transfer scene-update leadership; conference owner (hostTopic) is unchanged."""
+    try:
+        data = await _parse_request_body(request)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse request: {e}")
+
+    host_topic = str(data.get("hostTopic") or data.get("user") or "").strip()
+    scene_leader_topic = str(
+        data.get("sceneLeaderTopic") or data.get("leadTopic") or ""
+    ).strip()
+    leader_user_name = str(
+        data.get("leaderUserName") or data.get("leader_user_name") or ""
+    ).strip()
+
+    if not host_topic:
+        raise HTTPException(status_code=400, detail="hostTopic is required")
+    if not scene_leader_topic:
+        raise HTTPException(status_code=400, detail="sceneLeaderTopic is required")
+
+    match = None
+    for conf in cast_hub.conferences:
+        if _conference_host_topic(conf) == host_topic:
+            match = conf
+            break
+    if not match:
+        raise HTTPException(status_code=404, detail="Conference not found")
+
+    participants = _conference_participant_topics(match)
+    if scene_leader_topic not in participants:
+        raise HTTPException(
+            status_code=400,
+            detail="sceneLeaderTopic must be a conference participant",
+        )
+
+    match["sceneLeaderTopic"] = scene_leader_topic
+    if not match.get("hostTopic"):
+        match["hostTopic"] = host_topic
+
+    leader_label = _host_user_name_for_topic(scene_leader_topic, leader_user_name)
+    if not leader_label:
+        leader_label = scene_leader_topic
+    title = str(match.get("title") or "").strip()
+
+    await _send_conference_hub_event(
+        "conference-lead",
+        host_topic,
+        participants,
+        {
+            "title": title,
+            "hostTopic": host_topic,
+            "sceneLeaderTopic": scene_leader_topic,
+            "leaderUserName": leader_label,
+            "leaderLabel": leader_label,
+            "participants": _conference_participant_subscribers(match),
+        },
+    )
+    cast_hub.log(
+        f"Conference lead: {title!r} sceneLeader={scene_leader_topic} host={host_topic}"
+    )
+    await cast_hub.send_admin_refresh_command()
+    return {"status": "updated", "conference": match}
 
 
 @app.delete("/api/hub/conference")
@@ -3355,7 +3424,7 @@ async def _parse_binary_batch_publish(request: Request) -> tuple:
             status_code=400,
             detail=(
                 "binary batch publish publish is only supported for binary-family events "
-                "(hub.event starting with dicom, nifti, jpg, png, nrrd, or imagingstudy)"
+                "(hub.event starting with dicom, nifti, jpg, png, nrrd, imagingstudy, or scene)"
             ),
         )
 

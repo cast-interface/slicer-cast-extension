@@ -3,7 +3,9 @@
   "product": "LUNGSCREENING",
   "title": "Lung Screening",
   "location": "Toronto, Canada",
-  "summary": "CT lung screening (dicom-send / nifti-send). Returns a screening result line.",
-  "githubUrl": "https://github.com/cast-interface/slicer-cast-extension/blob/main/CastInterface/cast_resource_servers/products/lung_screening.py",
-  "hubEvent": "dicom-send"
+  "summary": "CT lung screening (dicom-send / nifti-send). Returns a 2048-D vector.",
+  "githubUrl": "https://github.com/rphellan/slicerW45",
+  "websiteUrl": "https://projectweek.na-mic.org/PW45_2026_Boston/Projects/ExtractingDeepLearningFeaturesFromCtImagesOfTheThoracicRegionForLungCancerApplications/",
+  "hubEvent": "dicom-send",
+  "enabled": false
 }

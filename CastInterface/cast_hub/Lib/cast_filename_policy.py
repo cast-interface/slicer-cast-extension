@@ -24,6 +24,8 @@ _DEFAULT_ALLOWED_SUFFIXES: Tuple[str, ...] = (
     ".zip",
     ".tar",
     ".gz",
+    # Content-addressed LiveScene / mrson chunk blobs (sha256-<hex>.bin).
+    ".bin",
 )
 
 # Inner dotted segments that must never appear before the allowed outer suffix.

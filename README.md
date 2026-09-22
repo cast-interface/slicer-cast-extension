@@ -28,8 +28,9 @@ pip install -e cast_py_client
 # Terminal 1 — Hub
 cd cast_hub && pip install -r requirements.txt && python cast_hub.py --port 2018
 
-# Terminal 2 — Resource server (example)
+# Terminal 2 — Resource server (examples)
 python cast_resource_servers/products/neuro_seg.py --local
+# python cast_resource_servers/products/total_segmentator.py --local
 
 # Terminal 3 — Slicer image display (Slicer required; module NOT required)
 Slicer --python-script cast_slicer_image_display/run_image_display.py -- --local --topic USER-1

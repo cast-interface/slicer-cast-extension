@@ -7,11 +7,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Install Python dependencies first for better build caching.
-COPY requirements.txt /app/requirements.txt
+# Use Azure requirements (no editable ../cast_py_client pin).
+COPY requirements-azure.txt /app/requirements.txt
 RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
-# Copy cast hub sources.
+# Copy cast hub sources (include vendored cast_py_client when present in build context).
 COPY . /app
+# Monorepo Docker builds may COPY cast_py_client separately; zip deploy vendors it.
 
 # Startup script for Azure Linux Web App container.
 RUN chmod +x /app/start-azure.sh

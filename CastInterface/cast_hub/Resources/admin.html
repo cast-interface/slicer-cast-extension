@@ -1961,23 +1961,48 @@
             return tooltip ? ` title="${escapeAttr(tooltip)}"` : '';
         }
 
-        function findDeliveryRecipientsInWindow(allEntries, topic, eventName, tStart, tEnd) {
+        function findDeliveryRecipientsInWindow(
+            allEntries,
+            topic,
+            eventName,
+            tStart,
+            tEnd,
+            publisherName
+        ) {
+            const publishTopic = topic || '';
+            const pubKey = String(publisherName || '').trim().toLowerCase();
             const names = new Set();
             for (const e of allEntries) {
                 if (e.direction !== 'sent') {
                     continue;
                 }
-                if ((e.topic || '') !== topic || (e.event_name || '') !== eventName) {
+                if ((e.event_name || '') !== eventName) {
                     continue;
                 }
                 const t = new Date(e.timestamp).getTime();
                 if (!Number.isFinite(t) || t < tStart || t > tEnd) {
                     continue;
                 }
-                const u = (e.subscriber || e.user || '').trim();
-                if (u) {
-                    names.add(u);
+                const sentTopic = e.topic || '';
+                const sameTopic = sentTopic === publishTopic;
+                // Conference fan-out logs sent rows under the participant topic; match those
+                // by publisher identity when the topic differs.
+                if (!sameTopic) {
+                    if (!pubKey) {
+                        continue;
+                    }
+                    const sentPub = formatPublisher(e).trim().toLowerCase();
+                    if (!sentPub || sentPub === 'n/a' || sentPub !== pubKey) {
+                        continue;
+                    }
                 }
+                const u = (e.subscriber || e.user || '').trim();
+                if (!u) {
+                    continue;
+                }
+                names.add(
+                    sameTopic || !sentTopic ? u : `${u} (${sentTopic})`
+                );
             }
             return Array.from(names).sort((a, b) => a.localeCompare(b));
         }
@@ -2301,7 +2326,8 @@
                     rep.topic || '',
                     rep.event_name || '',
                     tMin - 1500,
-                    tMax + 3500
+                    tMax + 3500,
+                    formatPublisher(rep)
                 );
                 rows.push({ rep, recipientList });
             }

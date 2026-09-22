@@ -37,8 +37,6 @@ DEFAULT_DISPLAY_TOPIC = "USER-1"
 _SETTINGS_GROUP = "CastInterface"
 _SETTINGS_KEY_HUB = "imageDisplayHub"
 _SETTINGS_KEY_TOPIC = "imageDisplayTopic"
-_SETTINGS_KEY_PRODUCT = "imageDisplayProductName"
-_SETTINGS_KEY_VERSION = "imageDisplayProductVersion"
 
 _STATUS_TEXT_STYLE_IDLE = "color: palette(text);"
 _STATUS_TEXT_STYLE_CONNECTED = "color: #2e7d32; font-weight: bold;"
@@ -135,8 +133,6 @@ class CastImageDisplayClientWidget:
         self._main_queue_timer.setInterval(MAIN_QUEUE_TIMER_MS)
         self._main_queue_timer.timeout.connect(self._main_queue_process)
 
-        self.productNameEdit: Optional[qt.QLineEdit] = None
-        self.versionEdit: Optional[qt.QLineEdit] = None
         self.hubComboBox: Optional[qt.QComboBox] = None
         self.openHubButton: Optional[qt.QPushButton] = None
         self.topicEdit: Optional[qt.QLineEdit] = None
@@ -155,24 +151,19 @@ class CastImageDisplayClientWidget:
         layout.setLabelAlignment(qt.Qt.AlignLeft)
         layout.setHorizontalSpacing(84)
 
-        product_row = qt.QWidget()
-        product_row_layout = qt.QHBoxLayout(product_row)
-        product_row_layout.setContentsMargins(0, 0, 0, 0)
-        self.productNameEdit = qt.QLineEdit(
-            self._load_setting(_SETTINGS_KEY_PRODUCT, DISPLAY_PRODUCT_NAME)
+        self.conferenceButton = qt.QPushButton(_("Start a conference"))
+        self.conferenceButton.setToolTip(_("Create or manage a Cast conference"))
+        self.conferenceButton.clicked.connect(self._on_conference)
+        self.conferenceButton.enabled = False
+        self.conferenceButton.setSizePolicy(
+            qt.QSizePolicy.Fixed, qt.QSizePolicy.Fixed
         )
-        self.productNameEdit.setPlaceholderText(_("Product name"))
-        self.productNameEdit.setToolTip(_("subscriber.product.name on the hub"))
-        version_label = qt.QLabel(_("Version:"))
-        self.versionEdit = qt.QLineEdit(
-            self._load_setting(_SETTINGS_KEY_VERSION, DISPLAY_PRODUCT_VERSION)
-        )
-        self.versionEdit.setMaximumWidth(80)
-        self.versionEdit.setToolTip(_("subscriber.product.version on the hub"))
-        product_row_layout.addWidget(self.productNameEdit, 1)
-        product_row_layout.addWidget(version_label)
-        product_row_layout.addWidget(self.versionEdit)
-        layout.addRow(_("Product:"), product_row)
+        conference_row = qt.QWidget()
+        conference_row_layout = qt.QHBoxLayout(conference_row)
+        conference_row_layout.setContentsMargins(0, 0, 0, 0)
+        conference_row_layout.addWidget(self.conferenceButton, 0)
+        conference_row_layout.addStretch(1)
+        layout.addRow(_("Conferencing:"), conference_row)
 
         hub_row = qt.QWidget()
         hub_row_layout = qt.QHBoxLayout(hub_row)
@@ -199,22 +190,17 @@ class CastImageDisplayClientWidget:
         self.disconnectButton = qt.QPushButton(_("Disconnect"))
         self.disconnectButton.clicked.connect(self._on_disconnect)
         self.disconnectButton.enabled = False
-        self.conferenceButton = qt.QPushButton(_("Conferencing"))
-        self.conferenceButton.setToolTip(_("Create or manage a Cast conference"))
-        self.conferenceButton.clicked.connect(self._on_conference)
-        self.conferenceButton.enabled = False
         metrics = qt.QFontMetrics(self.hubComboBox.font)
         max_hub_text_w = max(
             metrics.horizontalAdvance(name) for name in HUBS.keys()
         )
         hub_combo_pad = 48
         self.hubComboBox.setMaximumWidth(max_hub_text_w + hub_combo_pad)
-        hub_row_layout.addWidget(self.hubComboBox, 0)
-        hub_row_layout.addWidget(self.openHubButton, 0)
         hub_row_layout.addWidget(self.connectButton, 0)
         hub_row_layout.addWidget(self.disconnectButton, 0)
+        hub_row_layout.addWidget(self.hubComboBox, 0)
+        hub_row_layout.addWidget(self.openHubButton, 0)
         hub_row_layout.addStretch(1)
-        hub_row_layout.addWidget(self.conferenceButton, 0)
         hub_row.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
         layout.addRow(_("Hub:"), hub_row)
 
@@ -249,26 +235,14 @@ class CastImageDisplayClientWidget:
             settings.setValue(_SETTINGS_KEY_HUB, self.hubComboBox.currentText)
         if self.topicEdit:
             settings.setValue(_SETTINGS_KEY_TOPIC, self.topicEdit.text.strip())
-        if self.productNameEdit:
-            settings.setValue(
-                _SETTINGS_KEY_PRODUCT, self.productNameEdit.text.strip()
-            )
-        if self.versionEdit:
-            settings.setValue(_SETTINGS_KEY_VERSION, self.versionEdit.text.strip())
         settings.endGroup()
 
-    def _product_name(self) -> str:
-        if self.productNameEdit:
-            name = self.productNameEdit.text.strip()
-            if name:
-                return name
+    @staticmethod
+    def _product_name() -> str:
         return DISPLAY_PRODUCT_NAME
 
-    def _product_version(self) -> str:
-        if self.versionEdit:
-            version = self.versionEdit.text.strip()
-            if version:
-                return version
+    @staticmethod
+    def _product_version() -> str:
         return DISPLAY_PRODUCT_VERSION
 
     def cleanup(self) -> None:
@@ -329,10 +303,6 @@ class CastImageDisplayClientWidget:
             self.conferenceButton.enabled = enabled
 
     def _set_fields_enabled(self, enabled: bool) -> None:
-        if self.productNameEdit:
-            self.productNameEdit.setEnabled(enabled)
-        if self.versionEdit:
-            self.versionEdit.setEnabled(enabled)
         if self.hubComboBox:
             self.hubComboBox.setEnabled(enabled)
         if self.openHubButton:
@@ -356,7 +326,7 @@ class CastImageDisplayClientWidget:
             )
 
     def _on_connect(self) -> None:
-        if not self.topicEdit or not self.hubComboBox or not self.productNameEdit:
+        if not self.topicEdit or not self.hubComboBox:
             return
         topic = self.topicEdit.text.strip()
         if not topic:
@@ -364,10 +334,6 @@ class CastImageDisplayClientWidget:
             return
 
         product_name = self._product_name()
-        if not product_name:
-            slicer.util.errorDisplay(_("Enter a product name before connecting."))
-            return
-
         product_version = self._product_version()
         subscriber = generate_subscriber_name(product_name)
 

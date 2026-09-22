@@ -37,6 +37,7 @@ DISPLAY_EVENTS = [
     "imagingstudy-close",
     "status-request",
     "livescene-request",
+    "scene-update",
     "annotation-update",
     "annotation-delete",
 ]
@@ -128,6 +129,8 @@ class ImageDisplayClientConnection:
         self._conference_active = False
         self._conference_title = ""
         self._conference_participants: List[str] = []
+        # Set while livesync subscribe awaits ImagingStudy-open fan-out payloadIds.
+        self._livesync_blob_files_future: Optional[asyncio.Future] = None
 
     def isHubThreadRunning(self) -> bool:
         return self._hub_thread is not None and self._hub_thread.is_alive()
@@ -220,6 +223,41 @@ class ImageDisplayClientConnection:
 
     def get_client(self) -> Optional[SlicerCastClient]:
         return self._client
+
+    def _complete_livesync_blob_echo(self, message: Dict[str, Any]) -> None:
+        """Fulfill pending livesync subscribe wait with hub-assigned payloadIds."""
+        fut = self._livesync_blob_files_future
+        if fut is None or fut.done():
+            return
+        event = message.get("event") if isinstance(message.get("event"), dict) else {}
+        context = event.get("context") if isinstance(event, dict) else None
+        files_raw = context.get("files") if isinstance(context, dict) else None
+        files: List[Dict[str, Any]] = []
+        if isinstance(files_raw, list):
+            for entry in files_raw:
+                if not isinstance(entry, dict):
+                    continue
+                meta: Dict[str, Any] = {}
+                for key in (
+                    "fileName",
+                    "mimeType",
+                    "role",
+                    "label",
+                    "byteLength",
+                    "payloadIds",
+                    "chunkByteLengths",
+                    "expiresAt",
+                ):
+                    if key in entry and entry[key] is not None:
+                        meta[key] = entry[key]
+                if meta.get("fileName"):
+                    files.append(meta)
+        fut.set_result(files)
+        LOGGER.info(
+            "livesync blob echo: files=%d with payloadIds=%d",
+            len(files),
+            sum(1 for f in files if f.get("payloadIds")),
+        )
 
     async def run_on_main_thread(self, fn: Callable[[], _T]) -> _T:
         """Run ``fn`` on the Slicer Qt main thread and await its result."""
@@ -368,6 +406,25 @@ class ImageDisplayClientConnection:
     def disconnectHub(self) -> None:
         global _active_connection
 
+        bridge = getattr(self, "_mrson_cast_bridge", None)
+        if bridge is not None:
+            done = threading.Event()
+
+            def detach_and_signal() -> None:
+                try:
+                    bridge.detach()
+                except Exception as exc:
+                    LOGGER.warning("Cast sink detach failed: %s", exc)
+                finally:
+                    done.set()
+
+            try:
+                self.schedule_main_thread(detach_and_signal, urgent=True)
+                done.wait(timeout=5.0)
+            except Exception as exc:
+                LOGGER.warning("Cast sink detach schedule failed: %s", exc)
+            self._mrson_cast_bridge = None
+
         self._want_hub_unsubscribe = True
         self._stop_event.set()
         if self._hub_thread:
@@ -386,11 +443,26 @@ class ImageDisplayClientConnection:
         self, message: Dict[str, Any]
     ) -> None:
         hub_event = hub_event_name(message)
+        # Ignore our own publishes (hub fans out to all topic subscribers including us).
+        own = self.get_subscriber_name()
+        from_sub = str(message.get("subscriber.name") or "").strip()
+        if own and from_sub and from_sub == own:
+            LOGGER.debug(
+                "Image Display Client ignoring own event=%s", hub_event
+            )
+            return
         if hub_event == "imagingstudy-open":
             self._apply_handler_state(handle_imaging_study_open(self, message))
             return
         if hub_event == "imagingstudy-close":
             self._apply_handler_state(handle_imaging_study_close(self, message))
+            return
+        if hub_event == "scene-update":
+            client = self._client
+            if client is None:
+                LOGGER.warning("Ignoring scene-update: hub client unavailable")
+                return
+            asyncio.create_task(self._handle_scene_update_task(client, message))
             return
         if hub_event == "annotation-update":
             from image_display_client_annotations import handle_annotation_update
@@ -436,6 +508,23 @@ class ImageDisplayClientConnection:
             LOGGER.warning(
                 "Image Display request handler failed event=%s id=%s: %s",
                 hub_event,
+                message.get("id"),
+                exc,
+            )
+
+    async def _handle_scene_update_task(
+        self, client: SlicerCastClient, message: Dict[str, Any]
+    ) -> None:
+        try:
+            from image_display_livesync_bridge import handle_scene_update
+
+            # Download any pending payloads before handling (legacy scene-update ops).
+            if has_pending_payload(message):
+                message = await client.fetch_all_payloads(message)
+            await handle_scene_update(self, client, message)
+        except Exception as exc:
+            LOGGER.warning(
+                "Image Display scene-update handler failed id=%s: %s",
                 message.get("id"),
                 exc,
             )

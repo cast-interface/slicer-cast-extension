@@ -2,9 +2,13 @@
   "id": "totalseg",
   "product": "TOTALSEG",
   "title": "Total Segmentator",
-  "location": "Frankfurt, Germany",
+  "location": "Basel, Switzerland",
   "summary": "Whole-body CT/MR multi-organ segmentation (dicom-send / nifti-send jobs). Returns DICOM SEG via dicom-send.",
   "githubUrl": "https://github.com/wasserth/TotalSegmentator",
   "websiteUrl": "https://totalsegmentator.com/",
-  "hubEvent": "dicom-send"
+  "buyMeACoffeeUrl": "https://www.buymeacoffee.com/totalsegmentator",
+  "hubEvent": "dicom-send",
+  "enabled": true,
+  "cite": "Jakob Wasserthal, Hanns-Christian Breit, Manfred T. Meyer, Maurice Pradella, Daniel Hinck, Alexander W. Sauter, Tobias Heye, Daniel T. Boll, Joshy Cyriac, Shan Yang, Michael Bach, and Martin Segeroth (2023). TotalSegmentator: Robust Segmentation of 104 Anatomic Structures in CT Images. Radiology Artificial Intelligence, 5:5.",
+  "citeUrl": "https://pubs.rsna.org/doi/10.1148/ryai.230024"
 }

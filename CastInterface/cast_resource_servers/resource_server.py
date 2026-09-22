@@ -57,6 +57,49 @@ _DICOM_SEND_EVENT = "dicom-send"
 _NIFTI_SEND_EVENT = "nifti-send"
 
 
+def format_connect_failure(exc: BaseException) -> str:
+    """Short, user-facing reason for a failed hub connect (no aiohttp stack dump)."""
+    if isinstance(exc, RuntimeError):
+        return str(exc).strip() or exc.__class__.__name__
+
+    text = str(exc).strip()
+    lowered = text.lower()
+    root: BaseException = exc
+    cause = exc.__cause__ or exc.__context__
+    while cause is not None and cause is not root:
+        root = cause
+        cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+
+    root_name = root.__class__.__name__
+    root_text = str(root).strip()
+    root_lower = root_text.lower()
+
+    if "refused" in lowered or "refused" in root_lower:
+        return "connection refused (hub not reachable)"
+    if (
+        "timed out" in lowered
+        or "timeout" in lowered
+        or "timed out" in root_lower
+        or root_name.endswith("TimeoutError")
+    ):
+        return "connection timed out"
+    if (
+        "name or service not known" in lowered
+        or "getaddrinfo failed" in lowered
+        or "nodename nor servname" in lowered
+    ):
+        return "DNS lookup failed"
+    if "ssl" in lowered and ("certificate" in lowered or "handshake" in lowered):
+        return f"TLS/SSL error: {root_text or text}"
+    if "Cannot connect to host" in text:
+        return text
+    if root_text and root_text != text:
+        return f"{root_name}: {root_text}"
+    if text:
+        return f"{exc.__class__.__name__}: {text}"
+    return exc.__class__.__name__
+
+
 def _ensure_cast_imports() -> None:
     """Add monorepo roots for cast_py_client and runtime (no Slicer)."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -457,8 +500,10 @@ async def _handle_status_request(
     )
 
 
-async def run(config: ResourceServerConfig, handlers: ResourceServerHandlers) -> None:
+async def run(config: ResourceServerConfig, handlers: ResourceServerHandlers) -> int:
+    """Run until cancelled. Returns ``0`` on clean stop, ``1`` if hub connect failed."""
     client = _build_client(config)
+    hub_def = resolve_hub_preset(config.use_local_hub)
 
     def on_state(state: str, _detail: Optional[Dict[str, Any]] = None) -> None:
         LOGGER.info("%s: connection state: %s", config.product_name, state)
@@ -469,9 +514,12 @@ async def run(config: ResourceServerConfig, handlers: ResourceServerHandlers) ->
     hub_connection = _StandaloneHubConnection(client, loop)
     register_connection(config.product_name, hub_connection)
     ctx = ResourceServerContext(client, config, loop, hub_connection)
+    connected = False
+    exit_code = 0
 
     try:
         await _connect(client, config)
+        connected = True
         while True:
             message = await client.message_queue.get()
             hub_event = hub_event_name(message)
@@ -492,9 +540,41 @@ async def run(config: ResourceServerConfig, handlers: ResourceServerHandlers) ->
             )
     except asyncio.CancelledError:
         raise
+    except Exception as exc:
+        if connected:
+            raise
+        exit_code = 1
+        reason = format_connect_failure(exc)
+        LOGGER.error(
+            "%s: could not connect to hub %s at %s: %s",
+            config.product_name,
+            hub_def["name"],
+            hub_def["hub_endpoint"],
+            reason,
+        )
+        if config.use_local_hub:
+            LOGGER.error(
+                "%s: is the local Cast hub running? "
+                "Start it with: python cast_hub/cast_hub.py --port 2018",
+                config.product_name,
+            )
+        else:
+            LOGGER.error(
+                "%s: check network access to the cloud hub, or pass --local "
+                "for http://127.0.0.1:2018",
+                config.product_name,
+            )
     finally:
         unregister_connection(config.product_name)
-        await client.close()
+        if connected:
+            await client.close()
+        else:
+            # Avoid noisy Cast close/unsubscribe stacks when auth never succeeded.
+            http = getattr(client, "_http", None)
+            if http is not None and getattr(client, "_owns_http", False):
+                await http.close()
+                client._http = None
+    return exit_code
 
 
 def run_sync(
@@ -526,6 +606,9 @@ def run_sync(
         hub_def["hub_endpoint"],
     )
     try:
-        asyncio.run(run(config, handlers))
+        exit_code = asyncio.run(run(config, handlers))
     except KeyboardInterrupt:
         LOGGER.info("%s: stopped", config.product_name)
+        return
+    if exit_code:
+        raise SystemExit(exit_code)

@@ -3,7 +3,8 @@
   "product": "NEURO_SEG",
   "title": "Subcortical segmentation",
   "location": "Montreal, Canada",
-  "summary": "Neuro / subcortical segmentation (nifti-send). Prefers a NIfTI volume input.",
-  "githubUrl": "https://github.com/cast-interface/slicer-cast-extension/blob/main/CastInterface/cast_resource_servers/products/neuro_seg.py",
-  "hubEvent": "nifti-send"
+  "summary": "Neuro / subcortical segmentation (nifti-send). Improved white and pial surfaces and parcellation (aparc+aseg) from recon-all pipeline (FreeSurfer 7.4.1) through added dataset",
+  "websiteUrl": "https://projectweek.na-mic.org/PW45_2026_Boston/Projects/ReconAllCorrectionScriptBasedOnManualSubcorticalSegmentationFiles/",
+  "hubEvent": "nifti-send",
+  "enabled": true
 }
